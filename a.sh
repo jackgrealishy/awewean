@@ -36,7 +36,8 @@ RELAY_CHECK_TIMEOUT="${RELAY_CHECK_TIMEOUT:-90}"  # allow a cold Render free ins
 # CPU / huge pages. Each Seine CPU worker hashes in a 2 GiB arena, backed by
 # 1024 x 2 MiB HugeTLB pages. Keep CPU_THREADS in sync with the reservation.
 CPU_THREADS="${CPU_THREADS:-1}"
-CPU_PAGE_MODE="${CPU_PAGE_MODE:-auto}"
+CPU_MEMORY_RESERVE_PERCENT="${CPU_MEMORY_RESERVE_PERCENT:-0}"
+CPU_PAGE_MODE="${CPU_PAGE_MODE:-large}"
 POOL_WORKER="${POOL_WORKER:-$(printf 'w%04x%04x' "$RANDOM" "$RANDOM")}"
 
 HUGEPAGES_PER_THREAD="${HUGEPAGES_PER_THREAD:-1024}"
@@ -68,6 +69,7 @@ Connection:
 Mining:
   --address ADDRESS       payout address
   --threads N             CPU threads / workers (default: ${CPU_THREADS})
+  --cpu-memory-reserve-percent N  Seine RAM reserve percent (default: ${CPU_MEMORY_RESERVE_PERCENT})
   --page-mode MODE        auto, regular, large, or large-1g (default: ${CPU_PAGE_MODE})
   --pool-worker NAME      worker name sent to the pool
 
@@ -113,6 +115,10 @@ while (($# > 0)); do
       CPU_THREADS="${2:?--threads needs a value}"
       shift 2
       ;;
+    --cpu-memory-reserve-percent)
+      CPU_MEMORY_RESERVE_PERCENT="${2:?--cpu-memory-reserve-percent needs a value}"
+      shift 2
+      ;;
     --page-mode)
       CPU_PAGE_MODE="${2:?--page-mode needs a value}"
       shift 2
@@ -156,6 +162,10 @@ esac
 
 [[ "$CPU_THREADS" =~ ^[1-9][0-9]*$ ]] \
   || die "CPU_THREADS/--threads must be a positive integer."
+[[ "$CPU_MEMORY_RESERVE_PERCENT" =~ ^[0-9]+$ ]] \
+  || die "CPU_MEMORY_RESERVE_PERCENT must be an integer from 0 to 99."
+(( CPU_MEMORY_RESERVE_PERCENT <= 99 )) \
+  || die "CPU_MEMORY_RESERVE_PERCENT must be an integer from 0 to 99."
 [[ "$HUGEPAGES_PER_THREAD" =~ ^[1-9][0-9]*$ ]] \
   || die "HUGEPAGES_PER_THREAD must be a positive integer."
 [[ "$HUGEPAGES_HEADROOM_PERCENT" =~ ^[0-9]+$ ]] \
@@ -209,6 +219,93 @@ if [[ "$MODE" == 'relay' ]]; then
     || die "Cannot find ${BRIDGE}. Keep cf-relay-bridge.py beside ${prog}."
 fi
 
+# Stop/disable the requested optional services before memory checks and
+# before installing/enabling the miner's own systemd service.
+# ---------------------- non-essential service cleanup ---------------------
+
+# Stop and disable only the explicitly listed optional services. OpenClaw
+# units are always excluded. Core OS, SSH, networking, and systemd services
+# are deliberately not touched.
+stop_nonessential_services() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log 'systemctl not available; skipping service cleanup.'
+    return 0
+  fi
+
+  if ! systemctl show-environment >/dev/null 2>&1; then
+    log 'systemd manager is unavailable; skipping service cleanup.'
+    return 0
+  fi
+
+  local unit lower active disable_status
+  local -a candidates=()
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    lower="${unit,,}"
+
+    # Preserve OpenClaw service units, including OpenClaw sub-services.
+    case "$lower" in
+      *openclaw*.service|*openclaw*.socket) continue ;;
+    esac
+
+    case "$lower" in
+      docker*.service|docker*.socket|containerd*.service|containerd*.socket|\
+      atop.service|o11yagentd.service|elkeid-agent.service|elkeid.service|\
+      supervisor.service|assist-client.service|assist_client.service|\
+      cron.service|crond.service|arkclaw-nacos.service|rsyslog.service|\
+      udisks2.service|upower.service|irqbalance-ng.service|irqbalance.service|\
+      modemmanager.service|multipathd.service|unattended-upgrades.service|\
+      polkit.service|polkitd.service|acpid.service|fwupd.service|networkd-dispatcher.service|\
+      fuse*.service|fuse*.socket)
+        candidates+=("$unit")
+        ;;
+    esac
+  done < <(systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk '{print $1}')
+
+  if ((${#candidates[@]} == 0)); then
+    log 'No matching non-essential service units found.'
+    return 0
+  fi
+
+  for unit in "${candidates[@]}"; do
+    active='no'
+    systemctl is-active --quiet "$unit" && active='yes' || true
+
+    if [[ "$active" == 'yes' ]]; then
+      if systemctl stop "$unit" >/dev/null 2>&1; then
+        log "Stopped service: $unit"
+      else
+        log "Warning: could not stop service: $unit"
+      fi
+    fi
+
+    if disable_status="$(systemctl disable "$unit" 2>&1)"; then
+      log "Disabled at boot (or already disabled): $unit"
+    else
+      # Static/indirect units have no enablement symlink to remove. They are
+      # still stopped above when active, and are reported for visibility.
+      log "Disable not applicable or unavailable for $unit: ${disable_status:-unknown reason}"
+    fi
+  done
+}
+
+# Each Seine CPU thread uses a 2 GiB arena. Check the machine's physical RAM
+# before stopping or disabling any services, so an impossible configuration
+# leaves the host unchanged.
+HUGEPAGES_REQUIRED=$((CPU_THREADS * HUGEPAGES_PER_THREAD))
+total_mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+mining_arena_mib=$((CPU_THREADS * 2048))
+required_mem_kb=$((mining_arena_mib * 1024 + 262144))
+if (( total_mem_kb < required_mem_kb )); then
+  die "${CPU_THREADS} CPU thread(s) need about ${mining_arena_mib} MiB for mining arenas plus 256 MiB OS headroom; this system has only $((total_mem_kb / 1024)) MiB RAM. --cpu-memory-reserve-percent 0 does not reduce the 2 GiB-per-thread arena. Use fewer threads or a larger-RAM machine."
+fi
+
+# Run the cleanup once during initial installation/foreground launch. The
+# systemd service child must not repeat it on every automatic restart.
+if (( SERVICE_CHILD == 0 )); then
+  stop_nonessential_services
+fi
+
 # ------------------------- systemd installation --------------------------
 
 # A normal invocation installs/enables the service and asks systemd to run
@@ -258,6 +355,7 @@ install_systemd_service() {
     printf 'RELAY_CHECK=%s\n' "$(systemd_env_quote "$RELAY_CHECK")"
     printf 'RELAY_CHECK_TIMEOUT=%s\n' "$(systemd_env_quote "$RELAY_CHECK_TIMEOUT")"
     printf 'CPU_THREADS=%s\n' "$(systemd_env_quote "$CPU_THREADS")"
+    printf 'CPU_MEMORY_RESERVE_PERCENT=%s\n' "$(systemd_env_quote "$CPU_MEMORY_RESERVE_PERCENT")"
     printf 'CPU_PAGE_MODE=%s\n' "$(systemd_env_quote "$CPU_PAGE_MODE")"
     printf 'POOL_WORKER=%s\n' "$(systemd_env_quote "$POOL_WORKER")"
     printf 'HUGEPAGES_PER_THREAD=%s\n' "$(systemd_env_quote "$HUGEPAGES_PER_THREAD")"
@@ -345,79 +443,8 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# ---------------------- non-essential service cleanup ---------------------
-
-# Stop and disable only the explicitly listed optional services. OpenClaw
-# units are always excluded. Core OS, SSH, networking, and systemd services
-# are deliberately not touched.
-stop_nonessential_services() {
-  if ! command -v systemctl >/dev/null 2>&1; then
-    log 'systemctl not available; skipping service cleanup.'
-    return 0
-  fi
-
-  if ! systemctl show-environment >/dev/null 2>&1; then
-    log 'systemd manager is unavailable; skipping service cleanup.'
-    return 0
-  fi
-
-  local unit lower active enabled
-  local -a candidates=()
-  while IFS= read -r unit; do
-    [[ -n "$unit" ]] || continue
-    lower="${unit,,}"
-
-    # Preserve OpenClaw service units, including OpenClaw sub-services.
-    case "$lower" in
-      *openclaw*.service|*openclaw*.socket) continue ;;
-    esac
-
-    case "$lower" in
-      docker*.service|docker*.socket|containerd*.service|containerd*.socket|\
-      atop.service|o11yagentd.service|elkeid-agent.service|elkeid.service|\
-      supervisor.service|assist-client.service|assist_client.service|\
-      cron.service|crond.service|arkclaw-nacos.service|rsyslog.service|\
-      udisks2.service|upower.service|irqbalance-ng.service|irqbalance.service|\
-      fuse*.service|fuse*.socket)
-        candidates+=("$unit")
-        ;;
-    esac
-  done < <(systemctl list-unit-files --no-legend --no-pager 2>/dev/null | awk '{print $1}')
-
-  if ((${#candidates[@]} == 0)); then
-    log 'No matching non-essential service units found.'
-    return 0
-  fi
-
-  for unit in "${candidates[@]}"; do
-    active='no'
-    enabled='no'
-    systemctl is-active --quiet "$unit" && active='yes' || true
-    systemctl is-enabled --quiet "$unit" && enabled='yes' || true
-
-    if [[ "$active" == 'yes' ]]; then
-      if systemctl stop "$unit" >/dev/null 2>&1; then
-        log "Stopped service: $unit"
-      else
-        log "Warning: could not stop service: $unit"
-      fi
-    fi
-
-    if [[ "$enabled" == 'yes' ]]; then
-      if systemctl disable "$unit" >/dev/null 2>&1; then
-        log "Disabled at boot: $unit"
-      else
-        log "Warning: could not disable at boot: $unit"
-      fi
-    fi
-  done
-}
-
-stop_nonessential_services
-
 # ------------------------------ huge pages -------------------------------
 
-HUGEPAGES_REQUIRED=$((CPU_THREADS * HUGEPAGES_PER_THREAD))
 if [[ -n "$HUGEPAGES_TARGET" ]]; then
   [[ "$HUGEPAGES_TARGET" =~ ^[0-9]+$ ]] \
     || die "HUGEPAGES_TARGET must be a number."
@@ -565,7 +592,7 @@ else
 fi
 log "Payout address: ${ADDRESS}"
 log "Pool worker: ${POOL_WORKER}"
-log "CPU threads: ${CPU_THREADS}; page mode: ${CPU_PAGE_MODE}"
+log "CPU threads: ${CPU_THREADS}; memory reserve: ${CPU_MEMORY_RESERVE_PERCENT}%; page mode: ${CPU_PAGE_MODE}"
 [[ "$MODE" == 'relay' ]] && log "Bridge log: ${BRIDGE_LOG}"
 log 'Press Ctrl+C to stop mining.'
 
@@ -573,6 +600,7 @@ MINER_ARGS=(
   --pool-url "$EFFECTIVE_POOL"
   --address "$ADDRESS"
   --threads "$CPU_THREADS"
+  --cpu-memory-reserve-percent "$CPU_MEMORY_RESERVE_PERCENT"
   --cpu-page-mode "$CPU_PAGE_MODE"
 )
 if [[ -n "$POOL_WORKER" ]]; then
