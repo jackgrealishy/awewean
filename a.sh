@@ -50,6 +50,7 @@ log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 prog="$(basename -- "${BASH_SOURCE[0]}")"
+SERVICE_CHILD=0
 
 usage() {
   cat <<EOF
@@ -69,6 +70,12 @@ Mining:
   --threads N             CPU threads / workers (default: ${CPU_THREADS})
   --page-mode MODE        auto, regular, large, or large-1g (default: ${CPU_PAGE_MODE})
   --pool-worker NAME      worker name sent to the pool
+
+Service:
+  Normal invocation installs/enables seine-miner.service when systemd is available.
+  systemctl status seine-miner     check service status
+  systemctl stop seine-miner      stop it intentionally
+  journalctl -u seine-miner -f    follow service logs
 
 Other:
   -h, --help              show this help
@@ -113,6 +120,11 @@ while (($# > 0)); do
     --pool-worker)
       POOL_WORKER="${2:?--pool-worker needs a value}"
       shift 2
+      ;;
+    --service-child)
+      # Internal flag used by the systemd unit; prevents installer recursion.
+      SERVICE_CHILD=1
+      shift
       ;;
     --check)
       RELAY_CHECK=1
@@ -195,6 +207,121 @@ if [[ "$MODE" == 'relay' ]]; then
     || die 'Relay mode needs python3 (apt install python3).'
   [[ -f "$BRIDGE" ]] \
     || die "Cannot find ${BRIDGE}. Keep cf-relay-bridge.py beside ${prog}."
+fi
+
+# ------------------------- systemd installation --------------------------
+
+# A normal invocation installs/enables the service and asks systemd to run
+# this same script in foreground mode. The internal --service-child flag
+# prevents the service process from trying to install/restart itself.
+SERVICE_NAME="seine-miner.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_ENV="/etc/default/seine-miner"
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
+
+systemd_quote_arg() {
+  local value="$1" escaped
+  escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g; s/%/%%/g')"
+  printf '"%s"' "$escaped"
+}
+
+# Path-valued systemd settings use C-style escapes rather than shell quotes.
+systemd_path_value() {
+  local value="$1"
+  value=${value//\\/\\x5c}
+  value=${value// /\\x20}
+  value=${value//$'\t'/\\x09}
+  value=${value//%/%%}
+  printf '%s' "$value"
+}
+
+systemd_env_quote() {
+  local value="$1" escaped
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die 'Configuration values must not contain newline characters.'
+  escaped="$(printf '%s' "$value" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+  printf '"%s"' "$escaped"
+}
+
+install_systemd_service() {
+  local unit_tmp env_tmp
+  unit_tmp="$(mktemp)"
+  env_tmp="$(mktemp)"
+
+  {
+    printf 'ADDRESS=%s\n' "$(systemd_env_quote "$ADDRESS")"
+    printf 'MODE=%s\n' "$(systemd_env_quote "$MODE")"
+    printf 'POOL_URL=%s\n' "$(systemd_env_quote "$POOL_URL")"
+    printf 'RELAY_URL=%s\n' "$(systemd_env_quote "$RELAY_URL")"
+    printf 'RELAY_TARGET=%s\n' "$(systemd_env_quote "$RELAY_TARGET")"
+    printf 'RELAY_LOCAL_PORT=%s\n' "$(systemd_env_quote "$RELAY_LOCAL_PORT")"
+    printf 'RELAY_CHECK=%s\n' "$(systemd_env_quote "$RELAY_CHECK")"
+    printf 'RELAY_CHECK_TIMEOUT=%s\n' "$(systemd_env_quote "$RELAY_CHECK_TIMEOUT")"
+    printf 'CPU_THREADS=%s\n' "$(systemd_env_quote "$CPU_THREADS")"
+    printf 'CPU_PAGE_MODE=%s\n' "$(systemd_env_quote "$CPU_PAGE_MODE")"
+    printf 'POOL_WORKER=%s\n' "$(systemd_env_quote "$POOL_WORKER")"
+    printf 'HUGEPAGES_PER_THREAD=%s\n' "$(systemd_env_quote "$HUGEPAGES_PER_THREAD")"
+    printf 'HUGEPAGES_HEADROOM_PERCENT=%s\n' "$(systemd_env_quote "$HUGEPAGES_HEADROOM_PERCENT")"
+    printf 'HUGEPAGES_TARGET=%s\n' "$(systemd_env_quote "$HUGEPAGES_TARGET")"
+    printf 'SYSCTL_CONF=%s\n' "$(systemd_env_quote "$SYSCTL_CONF")"
+  } > "$env_tmp"
+
+  cat > "$unit_tmp" <<EOF
+[Unit]
+Description=Seine CPU miner with optional WSS relay
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=$(systemd_path_value "$SCRIPT_DIR")
+EnvironmentFile=${SERVICE_ENV}
+ExecStartPre=/bin/sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true; echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || true'
+ExecStart=/bin/bash $(systemd_quote_arg "$SCRIPT_PATH") --service-child
+Restart=always
+RestartSec=10s
+OOMPolicy=continue
+KillMode=control-group
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  install -o root -g root -m 0600 "$env_tmp" "$SERVICE_ENV"
+  install -o root -g root -m 0644 "$unit_tmp" "$SERVICE_FILE"
+  rm -f "$env_tmp" "$unit_tmp"
+
+  systemctl daemon-reload
+  systemctl enable "$SERVICE_NAME"
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    log "Restarting existing ${SERVICE_NAME} with the updated configuration."
+    if ! systemctl restart "$SERVICE_NAME"; then
+      journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+      die "Could not restart ${SERVICE_NAME}."
+    fi
+  else
+    log "Starting and enabling ${SERVICE_NAME} at boot."
+    if ! systemctl start "$SERVICE_NAME"; then
+      journalctl -u "$SERVICE_NAME" -n 40 --no-pager >&2 || true
+      die "Could not start ${SERVICE_NAME}."
+    fi
+  fi
+
+  log "${SERVICE_NAME} is enabled. It will restart after unexpected exits and start again after reboot."
+  log "Check logs with: journalctl -u ${SERVICE_NAME} -f"
+}
+
+if (( SERVICE_CHILD == 0 )); then
+  if command -v systemctl >/dev/null 2>&1 && systemctl show-environment >/dev/null 2>&1; then
+    install_systemd_service
+    exit 0
+  else
+    log 'systemd manager is unavailable; running in foreground without automatic restart.'
+  fi
 fi
 
 # ------------------------------- cleanup ---------------------------------
