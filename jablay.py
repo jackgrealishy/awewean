@@ -20,6 +20,12 @@ Examples:
         --target bntpool.com:3333
 
 The Worker must expose a ?probe=1 mode for --check (relay-worker.js does).
+
+For proxied outbound connections, set HTTPS_PROXY (or https_proxy) to an
+HTTP proxy URL such as http://127.0.0.1:3128. Optional proxy credentials may
+be embedded in that URL. ALL_PROXY/all_proxy is also supported as a fallback;
+NO_PROXY/no_proxy bypass rules are honored. Without a proxy, connections are
+made directly as before.
 """
 
 import argparse
@@ -138,6 +144,146 @@ def close_socket(sock, shutdown=False):
         sock.close()
     except OSError:
         pass
+
+
+def host_matches_no_proxy(host, port, no_proxy_value):
+    """Return True when host:port matches a NO_PROXY/no_proxy entry."""
+    host = host.strip("[]").lower().rstrip(".")
+    for item in (no_proxy_value or "").split(","):
+        rule = item.strip().lower()
+        if not rule:
+            continue
+        if rule == "*":
+            return True
+
+        rule_port = None
+        if rule.startswith("[") and "]" in rule:
+            closing = rule.index("]")
+            rule_host = rule[1:closing]
+            suffix = rule[closing + 1:]
+            if suffix.startswith(":") and suffix[1:].isdigit():
+                rule_port = int(suffix[1:])
+        elif rule.count(":") == 1:
+            candidate_host, candidate_port = rule.rsplit(":", 1)
+            if candidate_port.isdigit():
+                rule_host = candidate_host
+                rule_port = int(candidate_port)
+            else:
+                rule_host = rule
+        else:
+            rule_host = rule
+
+        if rule_port is not None and rule_port != port:
+            continue
+        rule_host = rule_host.lstrip(".").rstrip(".")
+        if not rule_host:
+            continue
+        if host == rule_host or host.endswith("." + rule_host):
+            return True
+    return False
+
+
+def get_proxy_url(scheme, host, port):
+    """Return the configured proxy URL, or None for a direct connection.
+
+    WSS uses HTTPS_PROXY/https_proxy; WS uses HTTP_PROXY/http_proxy.
+    ALL_PROXY/all_proxy is used as a fallback. NO_PROXY/no_proxy is honored.
+    """
+    no_proxy_value = os.environ.get("NO_PROXY") or os.environ.get("no_proxy")
+    if host_matches_no_proxy(host, port, no_proxy_value):
+        return None
+
+    names = (
+        ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+        if scheme == "wss"
+        else ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy")
+    )
+    for name in names:
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def connect_via_http_proxy(proxy_url, host, port, timeout):
+    """Open a TCP tunnel with HTTP CONNECT, supporting optional Basic auth.
+
+    Proxy URLs must use http://, for example:
+        http://127.0.0.1:3128
+        http://username:password@proxy.example:3128
+
+    The returned socket is a raw tunnel. The caller performs TLS over it for
+    WSS, preserving normal certificate and hostname verification.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    try:
+        parsed = urlsplit(proxy_url)
+        proxy_host = parsed.hostname
+        proxy_port = parsed.port or 80
+    except ValueError as exc:
+        raise ValueError(f"invalid HTTP proxy URL: {exc}") from exc
+
+    if parsed.scheme.lower() != "http" or not proxy_host:
+        raise ValueError("proxy URL must be http://[user:pass@]host[:port]")
+    if not 1 <= proxy_port <= 65535:
+        raise ValueError("HTTP proxy port must be between 1 and 65535")
+
+    raw = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        connect_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        authority = f"{connect_host}:{port}"
+        headers = [
+            f"CONNECT {authority} HTTP/1.1",
+            f"Host: {authority}",
+            "Proxy-Connection: Keep-Alive",
+        ]
+
+        if parsed.username is not None:
+            username = unquote(parsed.username)
+            password = unquote(parsed.password or "")
+            credentials = base64.b64encode(
+                f"{username}:{password}".encode("utf-8")
+            ).decode("ascii")
+            headers.append(f"Proxy-Authorization: Basic {credentials}")
+
+        request = "\r\n".join(headers) + "\r\n\r\n"
+        raw.sendall(request.encode("ascii"))
+
+        response = bytearray()
+        while b"\r\n\r\n" not in response:
+            chunk = raw.recv(4096)
+            if not chunk:
+                raise ConnectionError("HTTP proxy closed before completing CONNECT")
+            response.extend(chunk)
+            if len(response) > MAX_HTTP_HEADER_BYTES:
+                raise ConnectionError("HTTP proxy response headers too large")
+
+        header_bytes, extra = bytes(response).split(b"\r\n\r\n", 1)
+        status_line = header_bytes.split(b"\r\n", 1)[0].decode(
+            "latin-1", "replace"
+        )
+        status_match = re.match(
+            r"^HTTP/\d+(?:\.\d+)?\s+(\d{3})(?:\s|$)", status_line
+        )
+        if not status_match:
+            raise ConnectionError(
+                f"invalid HTTP proxy CONNECT response: {status_line!r}"
+            )
+        if status_match.group(1) != "200":
+            raise ConnectionError(f"HTTP proxy CONNECT rejected: {status_line}")
+        if extra:
+            # For CONNECT, the tunnel starts immediately after the header
+            # terminator. Unexpected bytes here cannot safely be fed into
+            # ssl.wrap_socket(), so fail explicitly rather than lose data.
+            raise ConnectionError(
+                "HTTP proxy sent unexpected data after CONNECT response headers"
+            )
+
+        return raw
+    except Exception:
+        close_socket(raw)
+        raise
 
 
 class WSConn:
@@ -276,11 +422,23 @@ class WSConn:
 
 
 def ws_connect(relay_url, target, connect_timeout=10.0, insecure=False):
-    """Open a WebSocket to the Worker and send the JSON target handshake."""
+    """Open a WebSocket to the Worker and send the JSON target handshake.
+
+    WSS/WS connections use the appropriate proxy environment variable when
+    configured. Secure WSS connections are tunneled with HTTP CONNECT; when
+    no proxy is configured (or NO_PROXY matches), connections remain direct.
+    """
     scheme, host, port, path = parse_ws_url(relay_url)
     target_host, target_port = target
 
-    raw = socket.create_connection((host, port), timeout=connect_timeout)
+    proxy_url = get_proxy_url(scheme, host, port)
+    if proxy_url:
+        log(f"connecting to relay through configured HTTP proxy ({scheme})")
+        raw = connect_via_http_proxy(
+            proxy_url, host, port, connect_timeout
+        )
+    else:
+        raw = socket.create_connection((host, port), timeout=connect_timeout)
     try:
         raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         raw.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
