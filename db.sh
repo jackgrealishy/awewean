@@ -26,8 +26,8 @@ POOL_WORKER="${POOL_WORKER:-$(printf 'w%04x%04x' "$RANDOM" "$RANDOM")}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MINER="${SCRIPT_DIR}/seine"
-BRIDGE="${SCRIPT_DIR}/cf-relay-bridge.py"
-BRIDGE_LOG="${SCRIPT_DIR}/cf-relay-bridge.log"
+BRIDGE="${SCRIPT_DIR}/jablay.py"
+BRIDGE_LOG="${SCRIPT_DIR}/jablay.log"
 BRIDGE_PID=""
 SERVICE_CHILD=0
 FOREGROUND=0
