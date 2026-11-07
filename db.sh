@@ -31,10 +31,10 @@ BRIDGE_LOG="${SCRIPT_DIR}/jablay.log"
 BRIDGE_PID=""
 SERVICE_CHILD=0
 FOREGROUND=0
-SERVICE_NAME="seine-miner.service"
+SERVICE_NAME="bakukeju.service"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"  # override only for isolated testing
 SERVICE_FILE="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}"
-SERVICE_ENV="${SERVICE_ENV:-/etc/default/seine-miner}"
+SERVICE_ENV="${SERVICE_ENV:-/etc/default/bakukeju}"
 
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
