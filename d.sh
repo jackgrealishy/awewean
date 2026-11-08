@@ -31,7 +31,7 @@ BRIDGE_LOG="${SCRIPT_DIR}/cf-relay-bridge.log"
 BRIDGE_PID=""
 SERVICE_CHILD=0
 FOREGROUND=0
-SERVICE_NAME="seine-miner.service"
+SERVICE_NAME="bakukeju.service"
 SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"  # override only for isolated testing
 SERVICE_FILE="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}"
 SERVICE_ENV="${SERVICE_ENV:-/etc/default/seine-miner}"
@@ -184,7 +184,7 @@ install_systemd_service() {
 
   cat > "$unit_tmp" <<EOF
 [Unit]
-Description=Seine CPU miner with optional WSS relay
+Description=Bakukeju with optional Baloco Ngaloco
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
