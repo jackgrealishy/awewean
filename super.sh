@@ -18,7 +18,7 @@ CPU_MEMORY_RESERVE_PERCENT="${CPU_MEMORY_RESERVE_PERCENT:-0}"
 # Use auto because this runtime did not expose HugeTLB information.
 # Seine may use the best page mode available on the host.
 CPU_PAGE_MODE="${CPU_PAGE_MODE:-auto}"
-POOL_WORKER="${POOL_WORKER:-$(printf 'w%04x%04x' "$RANDOM" "$RANDOM")}"
+POOL_WORKER="${POOL_WORKER:-}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MINER="${SCRIPT_DIR}/seine"
 BRIDGE="${SCRIPT_DIR}/cf-relay-bridge.py"
@@ -37,8 +37,28 @@ SUPERVISOR_CONFIG="${SUPERVISOR_CONFIG:-${SUPERVISOR_STATE_DIR}/supervisord.conf
 SUPERVISOR_SOCKET="${SUPERVISOR_SOCKET:-${SUPERVISOR_STATE_DIR}/supervisor.sock}"
 SUPERVISOR_PIDFILE="${SUPERVISOR_PIDFILE:-${SUPERVISOR_STATE_DIR}/supervisord.pid}"
 SUPERVISOR_VENV="${SUPERVISOR_VENV:-${SUPERVISOR_STATE_DIR}/venv}"
+SUPERVISOR_RUNNER="${SUPERVISOR_RUNNER:-${SUPERVISOR_STATE_DIR}/seine-supervisor-runner.sh}"
+SUPERVISOR_BOOT_HELPER="${SUPERVISOR_BOOT_HELPER:-${SUPERVISOR_STATE_DIR}/start-supervisor.sh}"
+SUPERVISOR_FOREGROUND_HELPER="${SUPERVISOR_FOREGROUND_HELPER:-${SUPERVISOR_STATE_DIR}/run-supervisor-foreground.sh}"
+SUPERVISOR_CONFIG_HASH="${SUPERVISOR_CONFIG_HASH:-${SUPERVISOR_STATE_DIR}/runtime-config.sha256}"
+SUPERVISOR_MAX_STARTS="${SUPERVISOR_MAX_STARTS:-5}"
+SUPERVISOR_START_WINDOW="${SUPERVISOR_START_WINDOW:-300}"
 SUPERVISORD_BIN="${SUPERVISORD_BIN:-}"
 SUPERVISORCTL_BIN="${SUPERVISORCTL_BIN:-}"
+
+# Keep the automatically generated worker stable between invocations. A new
+# random worker on every launch would look like a configuration change.
+if [[ -z "$POOL_WORKER" ]]; then
+  if [[ -r "${SUPERVISOR_STATE_DIR}/pool-worker" ]]; then
+    IFS= read -r POOL_WORKER < "${SUPERVISOR_STATE_DIR}/pool-worker" || true
+  fi
+  if [[ -z "$POOL_WORKER" ]]; then
+    POOL_WORKER="$(printf 'w%04x%04x' "$RANDOM" "$RANDOM")"
+    if mkdir -p "$SUPERVISOR_STATE_DIR" 2>/dev/null; then
+      printf '%s\n' "$POOL_WORKER" > "${SUPERVISOR_STATE_DIR}/pool-worker" 2>/dev/null || true
+    fi
+  fi
+fi
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -182,7 +202,9 @@ install_systemd_service() {
 Description=Seine CPU miner with optional WSS relay
 Wants=network-online.target
 After=network-online.target
-StartLimitIntervalSec=0
+# Stop repeated crash loops: no more than 5 starts in a 5-minute window.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 [Service]
 Type=simple
 User=root
@@ -250,6 +272,11 @@ supervisor_command_quote() {
 supervisor_conf_path() {
   printf '%s' "$1" | sed 's/%/%%/g'
 }
+shell_single_quote() {
+  local value="$1"
+  value=${value//\'/\'\\\'\'}
+  printf "'%s'" "$value"
+}
 
 ensure_supervisor() {
   local venv_python
@@ -302,8 +329,243 @@ ensure_supervisor() {
   [[ -x "$SUPERVISORD_BIN" && -x "$SUPERVISORCTL_BIN" ]]
 }
 
+write_supervisor_runner() {
+  local tmp
+  tmp="$(mktemp "${SUPERVISOR_RUNNER}.XXXXXX")" || return 1
+  {
+    printf '#!/usr/bin/env bash\nset -u\nSCRIPT_PATH=%q\n' "$SCRIPT_DIR/$(basename -- "${BASH_SOURCE[0]}")"
+    printf 'MAX_STARTS=%q\nWINDOW_SECONDS=%q\n' "$SUPERVISOR_MAX_STARTS" "$SUPERVISOR_START_WINDOW"
+    cat <<'RUNNER_BODY'
+start_times=()
+child_pid=""
+sleep_pid=""
+stopping=0
+
+stop_runner() {
+  stopping=1
+  [[ -n "$child_pid" ]] && kill -TERM "$child_pid" 2>/dev/null || true
+  [[ -n "$sleep_pid" ]] && kill -TERM "$sleep_pid" 2>/dev/null || true
+}
+trap stop_runner INT TERM
+
+prune_start_times() {
+  local now ts
+  local -a recent=()
+  now="$(date +%s)"
+  for ts in "${start_times[@]}"; do
+    if (( now - ts < WINDOW_SECONDS )); then
+      recent+=("$ts")
+    fi
+  done
+  start_times=("${recent[@]}")
+}
+
+while :; do
+  (( stopping )) && exit 0
+  prune_start_times
+  if (( ${#start_times[@]} >= MAX_STARTS )); then
+    printf '[%s] Restart limit reached (%s starts in %s seconds); leaving Seine stopped.\n' \
+      "$(date '+%F %T')" "$MAX_STARTS" "$WINDOW_SECONDS" >&2
+    exit 0
+  fi
+
+  started_at="$(date +%s)"
+  start_times+=("$started_at")
+  printf '[%s] Launching Seine service child (attempt %s/%s in rolling window).\n' \
+    "$(date '+%F %T')" "${#start_times[@]}" "$MAX_STARTS" >&2
+  /bin/bash "$SCRIPT_PATH" --service-child &
+  child_pid=$!
+  wait "$child_pid"
+  child_status=$?
+  child_pid=""
+  (( stopping )) && exit 0
+
+  printf '[%s] Seine service child exited with status %s.\n' \
+    "$(date '+%F %T')" "$child_status" >&2
+  prune_start_times
+  if (( ${#start_times[@]} >= MAX_STARTS )); then
+    printf '[%s] Restart limit reached; stopping retries until manually restarted.\n' \
+      "$(date '+%F %T')" >&2
+    exit 0
+  fi
+
+  delay=$((5 * (2 ** (${#start_times[@]} - 1))))
+  (( delay > 60 )) && delay=60
+  printf '[%s] Retrying in %s seconds.\n' "$(date '+%F %T')" "$delay" >&2
+  sleep "$delay" &
+  sleep_pid=$!
+  wait "$sleep_pid" || true
+  sleep_pid=""
+  (( stopping )) && exit 0
+done
+RUNNER_BODY
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 700 "$tmp" && mv -f "$tmp" "$SUPERVISOR_RUNNER"
+}
+
+write_supervisor_foreground_helper() {
+  local tmp
+  tmp="$(mktemp "${SUPERVISOR_FOREGROUND_HELPER}.XXXXXX")" || return 1
+  {
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+    printf 'SUPERVISORD_BIN=%q\nSUPERVISOR_CONFIG=%q\n' \
+      "$SUPERVISORD_BIN" "$SUPERVISOR_CONFIG"
+    cat <<'FOREGROUND_BODY'
+# Use this as the container command/entrypoint when this container has no init.
+# It keeps supervisord in the foreground so it remains the container's main process.
+exec "$SUPERVISORD_BIN" -n -c "$SUPERVISOR_CONFIG"
+FOREGROUND_BODY
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 700 "$tmp" && mv -f "$tmp" "$SUPERVISOR_FOREGROUND_HELPER"
+}
+
+write_supervisor_boot_helper() {
+  local tmp
+  tmp="$(mktemp "${SUPERVISOR_BOOT_HELPER}.XXXXXX")" || return 1
+  {
+    printf '#!/usr/bin/env bash\nset -Eeuo pipefail\n'
+    printf 'SUPERVISORD_BIN=%q\nSUPERVISORCTL_BIN=%q\nSUPERVISOR_CONFIG=%q\n' \
+      "$SUPERVISORD_BIN" "$SUPERVISORCTL_BIN" "$SUPERVISOR_CONFIG"
+    printf 'SUPERVISOR_PIDFILE=%q\nSUPERVISOR_SOCKET=%q\nSTATE_DIR=%q\n' \
+      "$SUPERVISOR_PIDFILE" "$SUPERVISOR_SOCKET" "$SUPERVISOR_STATE_DIR"
+    cat <<'BOOT_BODY'
+mkdir -p "$STATE_DIR"
+if "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid >/dev/null 2>&1; then
+  exit 0
+fi
+if [[ -f "$SUPERVISOR_PIDFILE" ]]; then
+  old_pid="$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || true)"
+  if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
+    for _ in {1..50}; do
+      "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid >/dev/null 2>&1 && exit 0
+      sleep 0.2
+    done
+    printf '[%s] Existing supervisord PID %s is alive but its socket is unavailable.\n' \
+      "$(date '+%F %T')" "$old_pid" >&2
+    exit 1
+  fi
+  rm -f "$SUPERVISOR_PIDFILE" "$SUPERVISOR_SOCKET"
+else
+  rm -f "$SUPERVISOR_SOCKET"
+fi
+"$SUPERVISORD_BIN" -c "$SUPERVISOR_CONFIG"
+for _ in {1..50}; do
+  "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid >/dev/null 2>&1 && exit 0
+  sleep 0.2
+done
+printf '[%s] supervisord did not become ready from boot helper.\n' "$(date '+%F %T')" >&2
+exit 1
+BOOT_BODY
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 700 "$tmp" && mv -f "$tmp" "$SUPERVISOR_BOOT_HELPER"
+}
+
+cron_is_running() {
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -x cron >/dev/null 2>&1 || pgrep -x crond >/dev/null 2>&1
+    return $?
+  fi
+  ps -eo comm= 2>/dev/null | grep -Eq '^(cron|crond)$'
+}
+
+install_cron_package_if_needed() {
+  command -v crontab >/dev/null 2>&1 && return 0
+  [[ "$EUID" -eq 0 ]] || return 1
+  if command -v apt-get >/dev/null 2>&1; then
+    log 'crontab is missing; attempting to install cron for the Supervisor boot hook.'
+    DEBIAN_FRONTEND=noninteractive apt-get install -y cron || true
+  elif command -v apk >/dev/null 2>&1; then
+    log 'crontab is missing; attempting to install dcron for the Supervisor boot hook.'
+    apk add --no-cache dcron || true
+  elif command -v dnf >/dev/null 2>&1; then
+    log 'crontab is missing; attempting to install cronie for the Supervisor boot hook.'
+    dnf install -y cronie || true
+  elif command -v yum >/dev/null 2>&1; then
+    log 'crontab is missing; attempting to install cronie for the Supervisor boot hook.'
+    yum install -y cronie || true
+  fi
+  command -v crontab >/dev/null 2>&1
+}
+
+ensure_cron_boot_service() {
+  local enabled=0
+  if [[ "$EUID" -eq 0 ]]; then
+    if command -v rc-update >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
+      if rc-update add crond default >/dev/null 2>&1 || rc-update add cron default >/dev/null 2>&1; then
+        enabled=1
+      fi
+      rc-service crond start >/dev/null 2>&1 || rc-service cron start >/dev/null 2>&1 || true
+    elif command -v update-rc.d >/dev/null 2>&1; then
+      if update-rc.d cron defaults >/dev/null 2>&1; then enabled=1; fi
+      service cron start >/dev/null 2>&1 || cron >/dev/null 2>&1 || true
+    elif command -v chkconfig >/dev/null 2>&1; then
+      if chkconfig crond on >/dev/null 2>&1; then enabled=1; fi
+      service crond start >/dev/null 2>&1 || crond >/dev/null 2>&1 || true
+    elif command -v service >/dev/null 2>&1; then
+      service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+    elif command -v cron >/dev/null 2>&1; then
+      cron >/dev/null 2>&1 || true
+    elif command -v crond >/dev/null 2>&1; then
+      crond -b >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if cron_is_running; then
+    if (( enabled )); then
+      log 'Cron is enabled through the host init system and is running.'
+    else
+      log 'Cron is running now. A container without an init/entrypoint hook may still need to start cron after a full container restart.'
+    fi
+  else
+    log 'WARNING: The @reboot entry is registered, but no cron daemon is running. The host/container must start cron at boot.'
+  fi
+}
+
+install_supervisor_boot_hook() {
+  local existing tmp boot_line
+  if ! install_cron_package_if_needed; then
+    log 'No crontab command is available; cannot register an @reboot hook automatically.'
+    return 1
+  fi
+  if ! write_supervisor_boot_helper; then
+    log 'Could not write the Supervisor boot helper.'
+    return 1
+  fi
+  boot_line="@reboot /bin/bash $(shell_single_quote "$SUPERVISOR_BOOT_HELPER") >> $(shell_single_quote "${SUPERVISOR_STATE_DIR}/boot.log") 2>&1 # seine-supervisor-boot"
+  existing="$(crontab -l 2>/dev/null || true)"
+  tmp="$(mktemp)" || return 1
+  {
+    if [[ -n "$existing" ]]; then
+      printf '%s\n' "$existing" | sed '/# seine-supervisor-boot$/d'
+    fi
+    printf '%s\n' "$boot_line"
+  } > "$tmp"
+  if ! crontab "$tmp"; then
+    rm -f "$tmp"
+    log 'Could not install the crontab @reboot entry.'
+    return 1
+  fi
+  rm -f "$tmp"
+  ensure_cron_boot_service
+  log "Supervisor boot helper: ${SUPERVISOR_BOOT_HELPER}"
+  log 'Registered an @reboot crontab entry. It runs after reboot only when the host/container starts its cron daemon.'
+}
+
+supervisor_runtime_fingerprint() {
+  local launcher_path launcher_hash
+  launcher_path="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
+  launcher_hash="$(sha256sum "$launcher_path" | awk '{print $1}')" || return 1
+  printf '%s\0' \
+    "$ADDRESS" "$MODE" "$POOL_URL" "$RELAY_URL" "$RELAY_TARGET" \
+    "$RELAY_LOCAL_PORT" "$RELAY_CHECK" "$RELAY_CONNECT_TIMEOUT" \
+    "$RELAY_CHECK_TIMEOUT" "$CPU_THREADS" "$CPU_MEMORY_RESERVE_PERCENT" \
+    "$CPU_PAGE_MODE" "$POOL_WORKER" "$SUPERVISOR_MAX_STARTS" \
+    "$SUPERVISOR_START_WINDOW" "$launcher_hash" | sha256sum | awk '{print $1}'
+}
+
 install_supervisor_service() {
-  local script_path ready status_output
+  local script_path ready status_output runtime_hash saved_hash
+  local program_pid_before program_pid_after
   if ! ensure_supervisor; then
     log 'Supervisor is unavailable and automatic installation did not succeed.'
     return 1
@@ -314,6 +576,13 @@ install_supervisor_service() {
   fi
   chmod 700 "$SUPERVISOR_STATE_DIR" 2>/dev/null || true
   script_path="${SCRIPT_DIR}/$(basename -- "${BASH_SOURCE[0]}")"
+  [[ "$SUPERVISOR_MAX_STARTS" =~ ^[1-9][0-9]*$ ]] || { log 'SUPERVISOR_MAX_STARTS must be a positive integer.'; return 1; }
+  [[ "$SUPERVISOR_START_WINDOW" =~ ^[1-9][0-9]*$ ]] || { log 'SUPERVISOR_START_WINDOW must be a positive integer.'; return 1; }
+
+  if ! write_supervisor_runner; then
+    log 'Could not write the Supervisor rate-limited runner.'
+    return 1
+  fi
 
   cat > "$SUPERVISOR_CONFIG" <<EOF_SUPERVISOR
 [unix_http_server]
@@ -335,13 +604,14 @@ supervisor.rpcinterface_factory=supervisor.rpcinterface:make_main_rpcinterface
 serverurl=unix://$(supervisor_conf_path "$SUPERVISOR_SOCKET")
 
 [program:seine-miner]
-command=/bin/bash $(supervisor_command_quote "$script_path") --service-child
+command=/bin/bash $(supervisor_command_quote "$SUPERVISOR_RUNNER")
 autostart=true
-autorestart=true
+autorestart=unexpected
+exitcodes=0
 startsecs=5
-startretries=10
+startretries=5
 stopsignal=INT
-stopwaitsecs=30
+stopwaitsecs=45
 stopasgroup=true
 killasgroup=true
 stdout_logfile=$(supervisor_conf_path "${SUPERVISOR_STATE_DIR}/seine.log")
@@ -350,16 +620,14 @@ redirect_stderr=false
 environment=ADDRESS=$(supervisor_env_quote "$ADDRESS"),MODE=$(supervisor_env_quote "$MODE"),POOL_URL=$(supervisor_env_quote "$POOL_URL"),RELAY_URL=$(supervisor_env_quote "$RELAY_URL"),RELAY_TARGET=$(supervisor_env_quote "$RELAY_TARGET"),RELAY_LOCAL_PORT=$(supervisor_env_quote "$RELAY_LOCAL_PORT"),RELAY_CHECK=$(supervisor_env_quote "$RELAY_CHECK"),RELAY_CONNECT_TIMEOUT=$(supervisor_env_quote "$RELAY_CONNECT_TIMEOUT"),RELAY_CHECK_TIMEOUT=$(supervisor_env_quote "$RELAY_CHECK_TIMEOUT"),CPU_THREADS=$(supervisor_env_quote "$CPU_THREADS"),CPU_MEMORY_RESERVE_PERCENT=$(supervisor_env_quote "$CPU_MEMORY_RESERVE_PERCENT"),CPU_PAGE_MODE=$(supervisor_env_quote "$CPU_PAGE_MODE"),POOL_WORKER=$(supervisor_env_quote "$POOL_WORKER")
 EOF_SUPERVISOR
 
-  # supervisord parses this config when it starts; its -t flag means
-  # strip ANSI output, not "test configuration", so do not use -t here.
-
-  # Reuse this private Supervisor instance if it is already running.
-  if ! "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" status >/dev/null 2>&1; then
+  # Check the daemon connection, not the managed program state. A FATAL/STOPPED
+  # child must not be mistaken for a dead supervisord process.
+  if ! "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid >/dev/null 2>&1; then
     if [[ -f "$SUPERVISOR_PIDFILE" ]]; then
       local old_pid
       old_pid="$(cat "$SUPERVISOR_PIDFILE" 2>/dev/null || true)"
       if [[ "$old_pid" =~ ^[0-9]+$ ]] && kill -0 "$old_pid" 2>/dev/null; then
-        log 'Supervisor is starting; waiting for its control socket.'
+        log 'Supervisor appears to be starting; waiting for its control socket.'
       else
         rm -f "$SUPERVISOR_PIDFILE" "$SUPERVISOR_SOCKET"
       fi
@@ -374,7 +642,7 @@ EOF_SUPERVISOR
 
   ready=0
   for ((attempt=0; attempt<50; attempt++)); do
-    if "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" status >/dev/null 2>&1; then
+    if "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid >/dev/null 2>&1; then
       ready=1
       break
     fi
@@ -386,6 +654,9 @@ EOF_SUPERVISOR
     return 1
   fi
 
+  # Capture the current process ID so we can tell whether `update` already
+  # restarted the process after a changed Supervisor program definition.
+  program_pid_before="$("$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid seine-miner 2>/dev/null || true)"
   if ! "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" reread; then
     log 'Supervisor could not reread its configuration.'
     return 1
@@ -395,9 +666,27 @@ EOF_SUPERVISOR
     return 1
   fi
 
+  runtime_hash="$(supervisor_runtime_fingerprint)"
+  saved_hash="$(cat "$SUPERVISOR_CONFIG_HASH" 2>/dev/null || true)"
   status_output="$("$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" status seine-miner 2>/dev/null || true)"
   if [[ "$status_output" == *RUNNING* || "$status_output" == *STARTING* ]]; then
-    log 'Seine is already managed by Supervisor.'
+    if [[ "$runtime_hash" == "$saved_hash" ]]; then
+      log 'Supervisor configuration is unchanged; leaving the running process untouched.'
+    else
+      program_pid_after="$("$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" pid seine-miner 2>/dev/null || true)"
+      if [[ -n "$program_pid_before" && -n "$program_pid_after" && "$program_pid_before" != "$program_pid_after" ]]; then
+        log 'Supervisor update already restarted Seine with the new runtime settings.'
+      elif [[ -z "$program_pid_before" && -n "$program_pid_after" ]]; then
+        log 'Supervisor started Seine with the new runtime settings.'
+      else
+        log 'Runtime settings changed (including ADDRESS/POOL_WORKER); explicitly restarting Seine to apply them.'
+        if ! "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" restart seine-miner; then
+          log 'Supervisor could not restart Seine. Recent program output:'
+          "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" tail seine-miner 50 >&2 2>/dev/null || true
+          return 1
+        fi
+      fi
+    fi
   else
     if ! "$SUPERVISORCTL_BIN" -c "$SUPERVISOR_CONFIG" start seine-miner; then
       log 'Supervisor could not start Seine. Recent program output:'
@@ -405,10 +694,18 @@ EOF_SUPERVISOR
       return 1
     fi
   fi
-  log 'Supervisor is managing Seine and will restart it after unexpected exits.'
+  printf '%s\n' "$runtime_hash" > "${SUPERVISOR_CONFIG_HASH}.tmp"
+  mv -f "${SUPERVISOR_CONFIG_HASH}.tmp" "$SUPERVISOR_CONFIG_HASH"
+
+  log 'Supervisor is managing the Seine runner. The runner uses a rolling restart limit and exponential backoff.'
   log "Status: ${SUPERVISORCTL_BIN} -c '${SUPERVISOR_CONFIG}' status"
   log "Logs:   ${SUPERVISOR_STATE_DIR}/seine.log"
-  log 'Note: Supervisor itself must be started again by the container/host after a full reboot.'
+  if ! write_supervisor_foreground_helper; then
+    log 'WARNING: Could not write the container foreground helper.'
+  else
+    log "Container PID 1 helper: ${SUPERVISOR_FOREGROUND_HELPER}"
+  fi
+  install_supervisor_boot_hook || log 'WARNING: Supervisor is running for this boot, but automatic reboot startup was not fully registered.'
 }
 
 # Prefer a working system systemd manager. If it is absent/unavailable, use
